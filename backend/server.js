@@ -31,38 +31,27 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // --- MIDDLEWARE: Credit System ---
 async function checkAndDeductCredits(req, res, next) {
     try {
-        // Check if user is authenticated via Clerk or using a Guest ID
         const isAuth = req.auth && !!req.auth.userId;
         const userId = isAuth ? req.auth.userId : req.headers['guest-id'];
 
-        if (!userId) {
-            return res.status(400).json({ error: "Missing authentication or guest ID." });
-        }
+        if (!userId || userId === 'null') return res.status(400).json({ error: "Missing authentication or guest ID." });
 
-        // Find or create the user in Neon DB
         let user = await prisma.user.findUnique({ where: { id: userId } });
-
         if (!user) {
             user = await prisma.user.create({
-                data: {
-                    id: userId,
-                    isGuest: !isAuth,
-                    credits: isAuth ? 100 : 2 // Give 100 to logged-in, 2 to guests
-                }
+                data: { id: userId, isGuest: !isAuth, credits: isAuth ? 100 : 2 }
             });
         }
 
         if (user.credits <= 0) {
-            return res.status(403).json({ error: "Insufficient credits. Please sign up or upgrade to generate more." });
+            return res.status(403).json({ error: "Insufficient credits." });
         }
 
-        // Deduct 1 credit
         await prisma.user.update({
             where: { id: userId },
             data: { credits: user.credits - 1 }
         });
 
-        // Pass updated credits to response header
         res.setHeader('x-remaining-credits', user.credits - 1);
         next();
     } catch (error) {
@@ -77,7 +66,7 @@ app.get('/api/credits', ClerkExpressWithAuth(), async (req, res) => {
         const isAuth = req.auth && !!req.auth.userId;
         const userId = isAuth ? req.auth.userId : req.headers['guest-id'];
 
-        if (!userId) return res.json({ credits: 0 });
+        if (!userId || userId === 'null') return res.json({ credits: 0 });
 
         let user = await prisma.user.findUnique({ where: { id: userId } });
         if (!user) {
@@ -87,45 +76,140 @@ app.get('/api/credits', ClerkExpressWithAuth(), async (req, res) => {
         }
         res.json({ credits: user.credits });
     } catch (error) {
-        console.error("Error fetching credits:", error);
         res.status(500).json({ error: "Failed to fetch credits." });
     }
 });
 
-// Get all chats for the logged-in user
+// ==========================================
+// CHAT API ENDPOINTS
+// ==========================================
+
+// 1. Get all chats for the sidebar
 app.get('/api/chats', ClerkExpressWithAuth(), async (req, res) => {
-    const userId = req.auth.userId || req.headers['guest-id'];
-    const chats = await prisma.chat.findMany({
-        where: { userId },
-        orderBy: { createdAt: 'desc' }
-    });
-    res.json(chats);
-});
-
-// Get messages for a specific chat
-app.get('/api/chats/:chatId', ClerkExpressWithAuth(), async (req, res) => {
-    const { chatId } = req.params;
-    const messages = await prisma.message.findMany({
-        where: { chatId },
-        orderBy: { createdAt: 'asc' }
-    });
-    res.json(messages);
-});
-
-// --- API ENDPOINT: Generate ATS Resume ---
-// Note: Protected by Clerk auth check AND the credit deduction middleware
-app.post('/api/generate-resume', ClerkExpressWithAuth(), upload.single('resume'), checkAndDeductCredits, async (req, res) => {
     try {
-        if (!req.file) {
-            return res.status(400).json({ error: 'No file uploaded.' });
+        const userId = req.auth?.userId || req.headers['guest-id'];
+        if (!userId || userId === 'null') return res.json([]);
+
+        const chats = await prisma.chat.findMany({
+            where: { userId },
+            orderBy: { createdAt: 'desc' }
+        });
+        res.json(chats);
+    } catch (error) {
+        res.status(500).json({ error: "Failed to fetch chats" });
+    }
+});
+
+// 2. Create a new chat
+app.post('/api/chats', ClerkExpressWithAuth(), async (req, res) => {
+    try {
+        const userId = req.auth?.userId || req.headers['guest-id'];
+        if (!userId || userId === 'null') return res.status(400).json({ error: "Missing user ID" });
+
+        let user = await prisma.user.findUnique({ where: { id: userId } });
+        if (!user) await prisma.user.create({ data: { id: userId, isGuest: !req.auth?.userId }});
+
+        const chat = await prisma.chat.create({
+            data: { title: req.body.title || 'New Conversation', userId }
+        });
+        res.json(chat);
+    } catch (error) {
+        res.status(500).json({ error: "Failed to create chat" });
+    }
+});
+
+// 3. Get messages for a specific chat
+app.get('/api/chats/:chatId/messages', ClerkExpressWithAuth(), async (req, res) => {
+    try {
+        const { chatId } = req.params;
+        const messages = await prisma.message.findMany({
+            where: { chatId },
+            orderBy: { createdAt: 'asc' }
+        });
+        res.json({ messages });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to fetch messages" });
+    }
+});
+
+// 4. Delete a chat
+app.delete('/api/chats/:chatId', ClerkExpressWithAuth(), async (req, res) => {
+    try {
+        const { chatId } = req.params;
+        await prisma.message.deleteMany({ where: { chatId } });
+        await prisma.chat.delete({ where: { id: chatId } });
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to delete chat" });
+    }
+});
+
+// 5. Send message and talk to Gemini
+app.post('/api/chat', ClerkExpressWithAuth(), async (req, res) => {
+    try {
+        const { chatId, message } = req.body;
+        if (!chatId || !message) return res.status(400).json({ error: 'Missing data' });
+
+        // Save User Message
+        await prisma.message.create({
+            data: { chatId, role: 'user', content: { text: message } }
+        });
+
+        // Get past history for Gemini Context
+        const history = await prisma.message.findMany({
+            where: { chatId },
+            orderBy: { createdAt: 'asc' }
+        });
+
+        // Format history for Gemini API. We slice off the last element because it's the user message we just saved.
+        const formattedHistory = history.slice(0, -1).map(msg => {
+            const textContent = typeof msg.content === 'object' ? msg.content.text : JSON.parse(msg.content).text;
+            return {
+                role: msg.role === 'assistant' ? 'model' : 'user',
+                parts: [{ text: textContent || '' }]
+            };
+        });
+
+        // Call Gemini
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+        const chat = model.startChat({ history: formattedHistory });
+        const result = await chat.sendMessage(message);
+        const reply = result.response.text();
+
+        // Save Assistant Message
+        await prisma.message.create({
+            data: { chatId, role: 'assistant', content: { text: reply } }
+        });
+
+        // Generate a dynamic title if it's the very first message
+        let updatedTitle = null;
+        if (history.length === 1) {
+            try {
+                 const titleResult = await model.generateContent(`Summarize this query in 2 to 4 words for a chat title: "${message}"`);
+                 updatedTitle = titleResult.response.text().replace(/["'\n]/g, '').trim();
+                 await prisma.chat.update({ where: { id: chatId }, data: { title: updatedTitle }});
+            } catch(e) {
+                 console.log("Title generation skipped due to error", e.message);
+            }
         }
 
+        res.json({ reply, title: updatedTitle });
+    } catch (error) {
+        console.error('Chat error:', error);
+        res.status(500).json({ error: 'Chat failed' });
+    }
+});
+
+// ==========================================
+// RESUME GENERATOR ENDPOINTS
+// ==========================================
+
+app.post('/api/generate-resume', ClerkExpressWithAuth(), upload.single('resume'), checkAndDeductCredits, async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+
         const jobDescription = req.body.jobDescription || "No job description provided.";
-
-        // 1. Convert the raw PDF file in memory to a base64 string for Gemini Vision
         const pdfBase64 = req.file.buffer.toString('base64');
-
-        // 2. Call Gemini AI (Updated to include ATS Scoring)
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
         
         const prompt = `
@@ -138,15 +222,15 @@ app.post('/api/generate-resume', ClerkExpressWithAuth(), upload.single('resume')
       Task 3: Provide 2-3 brief bullet points of feedback on what was improved or what is still missing.
       Task 4: Identify 5-10 exact keywords or short phrases from the Job Description that you successfully incorporated.
 
-      CRITICAL INSTRUCTIONS:
-      1. DO NOT INVENT OR HALLUCINATE ANY INFORMATION. 
+      
+CRITICAL INSTRUCTIONS:
+      1. DO NOT INVENT OR HALLUCINATE ANY INFORMATION. Do not add any fake skills, certifications, experience, or projects that the candidate does not have.
       2. Use EXACTLY the Name, Email, Phone, and Links found in the attached PDF.
-      3. Do not invent past companies, dates, or degrees. Only enhance the phrasing of the experience and projects I actually provided.
-      4. If personal info is missing, leave the string empty. Do not use placeholders.
-      5. MANDATORY: You MUST include every single project or work experience listed in the original resume. Do not drop any projects. You may aggressively rewrite the bullet points for those projects to better match the Job Description, but the project itself must remain.
-      6. MANDATORY: Keep the "summary" field extremely brief and punchy. It should be no more than 2 to 3 very short sentences focused entirely on hard skills and value. No fluff.
-      7. MANDATORY: Extract relevant soft skills (e.g., leadership, communication, cross-functional teamwork, problem-solving, Agile) from the Job Description and include them in the "skills" array alongside your technical skills.
-      8. DO NOT use any Markdown formatting (like **bold** or *italics*) in any of the text. Return plain text only.
+      3. DO NOT edit the Education section. Return it exactly as it appears in the original resume.
+      4. You MAY rewrite and edit the Professional Summary and Project/Experience descriptions to strictly align with the Job Description.
+      5. SUGGESTIONS: You may suggest additional skills, certifications, or projects the user should learn based on the JD, but you MUST explicitly append the tag "[SUGGESTED]" to the end of their names so the user knows they are recommendations.
+      6. MANDATORY: You MUST include every single project or work experience listed in the original resume. Do not drop any.
+      7. DO NOT use any Markdown formatting (like **bold** or *italics*) in any of the text. Return plain text only.
 
       Output ONLY a valid JSON object with the following structure:
       {
@@ -166,86 +250,35 @@ app.post('/api/generate-resume', ClerkExpressWithAuth(), upload.single('resume')
       ${jobDescription || "No job description provided."}
       `;
 
-        // 3. Send BOTH the text prompt AND the raw PDF file directly to Gemini
         const result = await model.generateContent([
-            prompt,
-            { 
-                inlineData: { 
-                    data: pdfBase64, 
-                    mimeType: "application/pdf" 
-                } 
-            }
+            prompt, { inlineData: { data: pdfBase64, mimeType: "application/pdf" } }
         ]);
 
         let aiResponse = result.response.text();
-
-        // 4. Clean and parse the AI output
-        aiResponse = aiResponse
-            .replace(/```json/g, '')
-            .replace(/```/g, '')
-            .replace(/\*\*/g, '') // <--- THIS VAPORIZES THE ASTERISKS
-            .trim();
+        aiResponse = aiResponse.replace(/```json/g, '').replace(/```/g, '').replace(/\*\*/g, '').trim();
             
-        const finalData = JSON.parse(aiResponse);
-
-        // 5. Send structured data (Score + Feedback + Resume) back to frontend
-        res.json({
-            message: 'Resume generated successfully',
-            data: finalData 
-        });
-
+        res.json({ message: 'Resume generated successfully', data: JSON.parse(aiResponse) });
     } catch (error) {
         console.error('Server/AI error:', error);
         res.status(500).json({ error: 'Failed to generate resume. Check backend console.' });
     }
 });
 
-// --- API ENDPOINT: Generate Cover Letter ---
-// Note: Protected by Clerk auth check AND the credit deduction middleware
 app.post('/api/generate-cover-letter', ClerkExpressWithAuth(), checkAndDeductCredits, async (req, res) => {
     try {
         const { resumeData, jobDescription } = req.body;
-
-        if (!resumeData || !jobDescription) {
-            return res.status(400).json({ error: 'Missing resume data or job description.' });
-        }
+        if (!resumeData || !jobDescription) return res.status(400).json({ error: 'Missing resume data or job description.' });
 
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
-        
-        const prompt = `
-        You are an expert career coach and professional copywriter.
-        Write a highly tailored, engaging, and concise cover letter (about 3-4 paragraphs) for the candidate applying for the job described below.
-        
-        CRITICAL INSTRUCTIONS:
-        1. Use the provided Candidate Resume Data to highlight relevant skills and experience.
-        2. DO NOT hallucinate or invent any experience, skills, or metrics not found in the resume data.
-        3. Match the tone of the Job Description.
-        4. Do not wrap the output in markdown code blocks or JSON. Return only the raw text of the cover letter.
-        
-        Candidate Resume Data:
-        ${JSON.stringify(resumeData)}
-
-        Target Job Description:
-        ${jobDescription}
-        `;
+        const prompt = `Write a highly tailored, engaging, and concise cover letter. Use the provided Candidate Resume Data. Do not wrap the output in markdown. Return plain text only.\nResume Data: ${JSON.stringify(resumeData)}\nJD: ${jobDescription}`;
 
         const result = await model.generateContent(prompt);
-        let coverLetterText = result.response.text();
-        
-        // Extra safeguard: Strip out asterisks from cover letter as well
-        coverLetterText = coverLetterText.replace(/\*\*/g, '').trim();
+        let coverLetterText = result.response.text().replace(/\*\*/g, '').trim();
 
-        res.json({
-            message: 'Cover letter generated successfully',
-            data: coverLetterText
-        });
-
+        res.json({ message: 'Cover letter generated successfully', data: coverLetterText });
     } catch (error) {
-        console.error('Server/AI error:', error);
         res.status(500).json({ error: 'Failed to generate cover letter.' });
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server is running on http://localhost:${PORT}`));
