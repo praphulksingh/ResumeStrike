@@ -1,0 +1,35 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// backend/prisma/schema.prisma
+
+model User {
+  id        String   @id
+  isGuest   Boolean  @default(false)
+  credits   Int      @default(0)
+  createdAt DateTime @default(now())
+  chats     Chat[]   // Relationship to chats
+}
+
+model Chat {
+  id        String    @id @default(uuid())
+  title     String    @default("New Resume")
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  messages  Message[]
+  createdAt DateTime  @default(now())
+}
+
+model Message {
+  id        String   @id @default(uuid())
+  chatId    String
+  chat      Chat     @relation(fields: [chatId], references: [id])
+  role      String   // 'user' or 'assistant'
+  content   Json     // Stores the full resumeData or cover letter text
+  createdAt DateTime @default(now())
+}
